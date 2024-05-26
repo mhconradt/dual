@@ -14,6 +14,11 @@ from streamlit.delta_generator import DeltaGenerator
 st.set_page_config(layout="wide")
 st.title("Dual")
 
+with st.sidebar:
+    oai_model = st.selectbox("OpenAI Model", ["gpt-4o", "gpt-4-turbo"])
+    ant_model = st.selectbox("Anthropic Model",
+                             ["claude-3-opus-20240229", "claude-3-sonnet-20240229", "claude-3-haiku-20240229"])
+
 
 def custom_logger(log):
     caller_frame = inspect.currentframe().f_back
@@ -128,16 +133,16 @@ if prompt_msg := chat_input():
     st.session_state.messages.append(prompt_msg)
     printm(prompt_msg, None)
     st.session_state.oai_cmp, st.session_state.ant_cmp = run_gather(
-        st.session_state.openai.complete(st.session_state.messages, model='gpt-4o'),
-        st.session_state.anthropic.complete(st.session_state.messages, model='claude-3-opus-20240229'),
+        st.session_state.openai.complete(st.session_state.messages, model=oai_model),
+        st.session_state.anthropic.complete(st.session_state.messages, model=ant_model),
     )
 if any(x is not None for x in (st.session_state.oai_cmp, st.session_state.ant_cmp)):
     oai, ant = st.columns(2)
     with oai:
-        st.markdown("<h3 style='text-align: center;'>OpenAI</h3>", unsafe_allow_html=True)
+        st.markdown(f"<h3 style='text-align: center;'>OpenAI ({oai_model})</h3>", unsafe_allow_html=True)
         printm(st.session_state.oai_cmp)
     with ant:
-        st.markdown("<h3 style='text-align: center;'>Anthropic</h3>", unsafe_allow_html=True)
+        st.markdown(f"<h3 style='text-align: center;'>Anthropic ({ant_model})</h3>", unsafe_allow_html=True)
         printm(st.session_state.ant_cmp)
     if user_selection := get_user_selection():
         st.session_state.messages.append(
