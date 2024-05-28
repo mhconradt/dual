@@ -46,7 +46,7 @@ class OpenAIEngine(ChatCompletionEngine):
     async def complete(self, messages: list[Message], model: str) -> Message:
         c = AsyncOpenAI()
         resp = await c.chat.completions.create(
-            model='gpt-4o',
+            model=model,
             max_tokens=1024,
             messages=[dataclasses.asdict(m) for m in messages]
         )
@@ -64,7 +64,7 @@ class AnthropicEngine(ChatCompletionEngine):
         completion = await c.messages.create(
             max_tokens=1024,
             messages=messages_,
-            model='claude-3-opus-20240229',
+            model=model,
             system=system
         )
         content = completion.content[0].text
