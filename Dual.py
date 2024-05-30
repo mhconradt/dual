@@ -9,8 +9,7 @@ from typing import Literal
 import anthropic
 import streamlit as st
 from anthropic.types import ContentBlockDeltaEvent
-from openai import AsyncOpenAI, AsyncStream
-from openai.types.chat import ChatCompletionChunk
+from openai import AsyncOpenAI
 from streamlit.delta_generator import DeltaGenerator
 
 st.set_page_config(layout="wide")
