@@ -8,6 +8,7 @@ from typing import Literal
 
 import anthropic
 import streamlit as st
+from anthropic.types import ContentBlockDeltaEvent
 from openai import AsyncOpenAI
 from streamlit.delta_generator import DeltaGenerator
 
@@ -15,7 +16,10 @@ st.set_page_config(layout="wide")
 st.title("Dual")
 
 with st.sidebar:
-    models = st.multiselect("Models", ["claude-3-opus-20240229", "claude-3-sonnet-20240229", "claude-3-haiku-20240229", "gpt-4o", "gpt-4-turbo"], default=["claude-3-opus-20240229", "gpt-4o"])
+    models = st.multiselect("Models",
+                            ["claude-3-opus-20240229", "claude-3-sonnet-20240229", "claude-3-haiku-20240229", "gpt-4o",
+                             "gpt-4-turbo"], default=["claude-3-opus-20240229", "gpt-4o"])
+
 
 def custom_logger(log):
     caller_frame = inspect.currentframe().f_back
@@ -40,38 +44,49 @@ class ChatCompletionEngine(ABC):
     @classmethod
     def for_model(cls, model: str) -> "ChatCompletionEngine":
         return OpenAIEngine(model) if model.startswith("gpt") else AnthropicEngine(model)
-        
+
     @abstractmethod
-    async def complete(self, messages: list[Message], model: str) -> Message:
+    async def complete(self, messages: list[Message], out: DeltaGenerator | None = None) -> Message:
         pass
 
 
 class OpenAIEngine(ChatCompletionEngine):
-    async def complete(self, messages: list[Message]) -> Message:
+    async def complete(self, messages: list[Message], out: DeltaGenerator | None = None) -> Message:
         c = AsyncOpenAI()
-        resp = await c.chat.completions.create(
-            model=self.model,
-            max_tokens=1024,
-            messages=[dataclasses.asdict(m) for m in messages]
-        )
-        content = resp.choices[0].message.content
+        content = ""
+        async with (await c.chat.completions.create(
+                model=self.model,
+                max_tokens=1024,
+                messages=[dataclasses.asdict(m) for m in messages],
+                stream=True,
+        )) as stream:
+            async for chunk in stream:
+                content_chunk = chunk.choices[0].delta.content
+                if content_chunk:
+                    content += content_chunk
+                mprintm(Message(role="assistant", content=content), self.model, out=out)
         custom_logger(f"Got completion {content} from OpenAIEngine.")
         return Message(role="assistant", content=content)
 
 
 class AnthropicEngine(ChatCompletionEngine):
 
-    async def complete(self, messages: list[Message]) -> Message:
+    async def complete(self, messages: list[Message], out: DeltaGenerator | None = None) -> Message:
         c = anthropic.AsyncAnthropic()
         messages_ = [dataclasses.asdict(m) for m in messages if m.role != "system"]
         system = next(iter(m.content for m in messages if m.role == "system"), None)
-        completion = await c.messages.create(
-            max_tokens=1024,
-            messages=messages_,
-            model=self.model,
-            system=system
-        )
-        content = completion.content[0].text
+        content = ""
+        async with (await c.messages.create(
+                max_tokens=1024,
+                messages=messages_,
+                model=self.model,
+                system=system,
+                stream=True,
+        )) as stream:
+            async for chunk in stream:
+                if isinstance(chunk, ContentBlockDeltaEvent):
+                    content += chunk.delta.text
+                mprintm(Message(role="assistant", content=content), self.model, out=out)
         custom_logger(f"Got completion {content} from AnthropicEngine.")
         return Message(role="assistant", content=content)
 
@@ -96,6 +111,14 @@ def printm(m: Message, out: DeltaGenerator | None = None):
     with out.container():
         with st.chat_message(m.role):
             st.markdown(m.content)
+
+
+def mprintm(m: Message, model: str, out: DeltaGenerator | None = None):
+    if out is None:
+        out = st.empty()
+    with out.container():
+        st.markdown(f"<h3 style='text-align: center;'>{model}</h3>", unsafe_allow_html=True)
+        printm(m)
 
 
 for message in st.session_state.messages:
@@ -124,16 +147,24 @@ def run_gather(*coros):
     return asyncio.run(f())
 
 
+def get_placeholders(n: int):
+    return [col.empty() for col in st.columns(n)]
+
+
+placeholders = None
+
 if prompt_msg := chat_input():
     st.session_state.messages.append(prompt_msg)
     printm(prompt_msg)
-    st.session_state.completions = run_gather(*(ChatCompletionEngine.for_model(model).complete(st.session_state.messages) for model in models))
+    placeholders = get_placeholders(len(models))
+    st.session_state.completions = run_gather(
+        *(ChatCompletionEngine.for_model(model).complete(st.session_state.messages, out=ph) for model, ph in
+          zip(models, placeholders)))
 if any(x is not None for x in st.session_state.completions):
-    columns = st.columns(len(models))
-    for model_, completion_, col_ in zip(models, st.session_state.completions, columns):
-        with col_:
-            st.markdown(f"<h3 style='text-align: center;'>{model_}</h3>", unsafe_allow_html=True)
-            printm(completion_)
+    if placeholders is None:
+        placeholders = get_placeholders(len(models))
+    for model_, completion_, col_ in zip(models, st.session_state.completions, placeholders):
+        mprintm(completion_, model_, out=col_)
     if user_selection := get_user_selection():
         st.session_state.messages.append(
             next(cmp for cmp, model in zip(st.session_state.completions, models) if model == user_selection)
