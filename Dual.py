@@ -18,9 +18,20 @@ st.title("Dual")
 ANTHROPIC_MODELS = ["claude-3-opus-20240229", "claude-3-sonnet-20240229", "claude-3-haiku-20240307"]
 OPENAI_MODELS = ["gpt-4o", "gpt-4-turbo", "gpt-4-turbo-2024-04-09", "gpt-4-0125-preview", "gpt-4-1106-preview",
                  "gpt-4-32k-0613", "gpt-3.5-turbo-0125", "gpt-3.5-turbo-1106"]
+MISTRAL_MODELS = ["codestral-latest"]
+
+
+def get_selected_models(*model_lists: list[str]) -> list[str]:
+    choices, defaults = [], []
+    for model_list in model_lists:
+        choices.extend(model_list)
+        # If you pass an empty list in here, you're fired.
+        defaults.append(model_list[0])
+    return st.multiselect("Models", choices, default=defaults)
+
 
 with st.sidebar:
-    models = st.multiselect("Models", ANTHROPIC_MODELS + OPENAI_MODELS, default=[ANTHROPIC_MODELS[0], OPENAI_MODELS[0]])
+    models = get_selected_models(ANTHROPIC_MODELS, OPENAI_MODELS, MISTRAL_MODELS)
 
 
 def custom_logger(log):
@@ -45,7 +56,13 @@ class ChatCompletionEngine(ABC):
 
     @classmethod
     def for_model(cls, model: str) -> "ChatCompletionEngine":
-        return OpenAIEngine(model) if model.startswith("gpt") else AnthropicEngine(model)
+        if model.startswith("gpt"):
+            return OpenAIEngine(model)
+        elif model.startswith("claude"):
+            return AnthropicEngine(model)
+        elif model.startswith("mistral") or model.startswith("codestral"):
+            return MistralEngine(model)
+        raise NotImplementedError(model)
 
     @abstractmethod
     async def complete(self, messages: list[Message], out: DeltaGenerator | None = None) -> Message:
@@ -90,6 +107,21 @@ class AnthropicEngine(ChatCompletionEngine):
                     content += chunk.delta.text
                 mprintm(Message(role="assistant", content=content), self.model, out=out)
         custom_logger(f"Got completion {content} from AnthropicEngine.")
+        return Message(role="assistant", content=content)
+
+
+class MistralEngine(ChatCompletionEngine):
+    async def complete(self, messages: list[Message], out: DeltaGenerator | None = None) -> Message:
+        from mistralai.async_client import MistralAsyncClient
+        c = MistralAsyncClient()
+        content = ""
+        async for chunk in c.chat_stream(
+                model=self.model,
+                messages=[dataclasses.asdict(m) for m in messages],
+        ):
+            content += chunk.choices[0].delta.content
+            mprintm(Message(role="assistant", content=content), self.model, out=out)
+        custom_logger(f"Got completion {content} for model {self.model} from MistralEngine.")
         return Message(role="assistant", content=content)
 
 
