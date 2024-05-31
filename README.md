@@ -7,4 +7,4 @@ export OPENAI_API_KEY=""
 export ANTHROPIC_API_KEY=""
 streamlit run Dual.py
 ```
-It's not strictly required to have API keys for both providers, but it's recommended.
+It's recommended, but not strictly required to have API keys for both providers.
