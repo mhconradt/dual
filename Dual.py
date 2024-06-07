@@ -1,10 +1,12 @@
 import asyncio
 import dataclasses
 import inspect
+import json
 import sys
 import tempfile
 from abc import ABC, abstractmethod
 from asyncio import Future
+from collections import defaultdict
 from datetime import datetime
 from typing import Literal, Callable, Any
 
@@ -13,6 +15,8 @@ import streamlit as st
 from anthropic.types import ContentBlockDeltaEvent
 from openai import AsyncOpenAI
 from streamlit.delta_generator import DeltaGenerator
+
+TOOL_ALIASES = {'run_shell_script': 'Shell'}
 
 st.set_page_config(layout="wide")
 st.title("Dual")
@@ -43,8 +47,11 @@ def custom_logger(log):
 
 @dataclasses.dataclass
 class Message:
-    role: Literal["user", "assistant", "system"]
+    role: Literal["user", "assistant", "system", "tool"]
     content: str
+    tool_call_id: str | None = None
+    name: str | None = None
+    tool_calls: "list[ToolCall] | None" = None
 
 
 @dataclasses.dataclass
@@ -56,7 +63,7 @@ class Tool:
     fn: Callable[[Any, ...], Future[str]]
 
     @classmethod
-    def from_function(cls, fn: Callable) -> "Tool":
+    def from_function(cls, fn: Callable[[Any, ...], Future[str]]) -> "Tool":
         annotations = inspect.get_annotations(fn)
 
         try:
@@ -83,18 +90,11 @@ class Tool:
             fn=fn,
         )
 
+    async def execute(self, **kwargs) -> str:
+        return await self.fn(**kwargs)
 
-async def exec_subprocess(program, *args):
-    with tempfile.TemporaryDirectory() as tmpdir:
-        proc = await asyncio.create_subprocess_exec(
-            program,
-            *args,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=tmpdir,
-        )
-        stdout, stderr = await proc.communicate()
-        return stdout, stderr, proc.returncode
+    async def __call__(self, *args, **kwargs):
+        return await self.fn(*args, **kwargs)
 
 
 async def shell(command: str):
@@ -109,58 +109,26 @@ async def shell(command: str):
         return stdout, stderr, proc.returncode
 
 
+def quote(text: str, sep: str = '```') -> str:
+    return '\n'.join([sep, text, sep])
+
+
 def get_program_output(exit_code, stderr, stdout):
     parts = []
     if stdout:
-        parts.extend(['## stdout', stdout])
+        parts.extend(['## stdout', quote(stdout)])
     if stderr:
-        parts.extend(['## stderr', stderr])
+        parts.extend(['## stderr', quote(stderr)])
     if exit_code:
         parts.extend([f"Process exited with code {exit_code}."])
     return '\n'.join(parts)
 
 
-async def compile_cxx_code(code: str, *, outfile: str | None = None) -> tuple[str, str, int]:
+async def run_shell_script(script: str) -> str:
     """
-    Compiles C++ code, returning stdout, stderr, and exit code.
-    """
-    with tempfile.NamedTemporaryFile(mode='w') as f:
-        # asyncio would be better for files.
-        f.write(code)
-        f.flush()
-        args = [f.name]
-        if outfile:
-            args.append('')
-        return await exec_subprocess('g++', *args)
-
-
-async def cxx_compile(code: str) -> str:
-    """
-    Compiles C++ code and returns the compiler output, errors, and exit code.
-    Useful for iteratively debugging compilation errors.
-    """
-    stdout, stderr, exit_code = await compile_cxx_code(code)
-    return get_program_output(exit_code, stderr, stdout)
-
-
-async def cxx_run(code: str) -> str:
-    """
-    Compiles and runs C++ code.
-    If compilation failed, i.e. exit code != 0, returns the compiler output, errors, and exit code.
-    Otherwise, returns the output, errors, and exit code of the program.
-    """
-    with tempfile.NamedTemporaryFile(mode='r') as f:
-        stdout, stderr, exit_code = await compile_cxx_code(code)
-        if exit_code:
-            return get_program_output(exit_code, stderr, stdout)
-        return ...
-
-
-async def run_shell_command(script: str) -> str:
-    """
-    Runs a shell program, returning its stdout, stderr, and exit code.
-    It's highly encouraged to use this to compile and run code.
-    1. This sequence of shell commands writes, compiles, and runs a C++ program:
+Runs a shell program, returning its stdout, stderr, and exit code.
+It's highly encouraged to use this to compile and run code.
+1. This sequence of shell commands writes, compiles, and runs a C++ program:
 cat <<EOF> scratch.cpp
 #include <iostream>
 
@@ -170,40 +138,83 @@ int main() {
 EOF
 c++ scratch.cpp -std=c++20 -o ./scratch
 ./scratch
-    2. This program writes and runs a Python program:
+2. This program writes and runs a Python program:
 cat <<EOF> scratch.py
 if __name__ == '__main__':
     print('Hello world')
 EOF
 python3 ./scratch.py
+3. If there are import errors using the default Python interpreter, you may need to install additional dependencies as a last resort, always doing so in a virtual environment:
+python3 -m venv ./venv
+source ./venv/bin/activate
+pip install pandas
+cat <<EOF> scratch.py
+import numpy as np
+import pandas as pd
+if __name__ == '__main__':
+    print(pd.DataFrame({'n': np.random.randn(100), 'x': np.arange(100)}).describe())
+EOF
+python3 ./scratch.py
+deactivate
     """
     stdout, stderr, code = await shell(script)
     return get_program_output(stdout, stderr, code)
 
 
 TOOLS = {
-    "C++ Compiler": Tool.from_function(cxx_compile)
+    "run_shell_script": Tool.from_function(run_shell_script),
 }
 
 
-class OpenAIEncoder:
-    def tool(self, tool: Tool) -> dict:
+class OpenAISerDe:
+    def messages(self, messages: list[Message]) -> list[dict]:
+        return [
+            {
+                "role": m.role,
+                "content": m.content,
+                "tool_calls": [self.encode_tool_call(tc) for tc in m.tool_calls] if m.tool_calls else None,
+                "tool_call_id": m.tool_call_id
+            }
+            for m in messages
+        ]
+
+    def encode_tool_call(self, tool_call: "ToolCall") -> dict:
         return {
+            "id": tool_call.id,
             "type": "function",
-            "name": tool.name,
-            "description": tool.description,
-            "parameters": tool.schema,
+            "function": {
+                "name": tool_call.name,
+                "arguments": json.dumps(tool_call.arguments)
+            }
         }
 
-
-class AnthropicEncoder:
-    def tool(self, tool: Tool) -> dict:
+    def encode_tool(self, tool: Tool) -> dict:
         return {
             "type": "function",
+            "function": {
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": tool.schema,
+            }
+        }
+
+    def decode_tool_call(self, tool_call: dict) -> "ToolCall":
+        return ToolCall(id=tool_call['id'], name=tool_call['name'], arguments=json.loads(tool_call['arguments']))
+
+
+class AnthropicSerDe:
+    def messages(self, messages: list[Message]) -> list[dict]:
+        return [{"role": m.role, "content": m.content} for m in messages if m.role != "system"]
+
+    def encode_tool(self, tool: Tool) -> dict:
+        return {
             "name": tool.name,
             "description": tool.description,
             "input_schema": tool.schema,
         }
+
+    def decode_tool_call(self, tool_call: dict) -> "ToolCall":
+        return ToolCall(name=tool_call['name'], arguments=json.loads(tool_call['arguments']))
 
 
 class ChatCompletionEngine(ABC):
@@ -226,22 +237,67 @@ class ChatCompletionEngine(ABC):
         pass
 
 
+@dataclasses.dataclass
+class ToolCall:
+    id: str
+    name: str
+    arguments: dict
+
+    async def execute(self) -> str:
+        return await TOOLS[self.name](**self.arguments)
+
+
 class OpenAIEngine(ChatCompletionEngine):
     async def complete(self, messages: list[Message], out: DeltaGenerator | None = None) -> Message:
         c = AsyncOpenAI()
+        messages = list(messages)
         content = ""
-        async with (await c.chat.completions.create(
-            model=self.model,
-            max_tokens=4096,
-            messages=[dataclasses.asdict(m) for m in messages],
-            stream=True,
-            tools=[OpenAIEncoder().tool(tool) for tool in self.tools]
-        )) as stream:
-            async for chunk in stream:
-                content_chunk = chunk.choices[0].delta.content
-                if content_chunk:
-                    content += content_chunk
-                mprintm(Message(role="assistant", content=content), self.model, out=out)
+        serde = OpenAISerDe()
+        tool_choices = [serde.encode_tool(tool) for tool in self.tools]
+        while not content:
+            messages_ = serde.messages(messages)
+            async with (await c.chat.completions.create(
+                model=self.model,
+                max_tokens=4096,
+                messages=messages_,
+                stream=True,
+                tools=tool_choices
+            )) as stream:
+                # We need to go deeper.
+                tool_calls = defaultdict(lambda: defaultdict(str))
+                async for chunk in stream:
+                    custom_logger(chunk)
+                    delta = chunk.choices[0].delta
+                    if not delta:
+                        continue
+                    if delta and delta.content:
+                        content_chunk = delta.content
+                        if content_chunk:
+                            content += content_chunk
+                        mprintm(Message(role="assistant", content=content), self.model, out=out)
+                    elif delta.tool_calls:
+                        for tool_call in delta.tool_calls:
+                            index = tool_call.index
+                            if tool_call.id:
+                                tool_calls[index]['id'] = tool_call.id
+                            if tool_call.function:
+                                if tool_call.function.name:
+                                    tool_calls[index]['name'] = tool_call.function.name
+                                if tool_call.function.arguments:
+                                    custom_logger(f"Got tool fragment {tool_call.function.arguments} from OpenAIEngine")
+                                    tool_calls[index]['arguments'] += tool_call.function.arguments
+                if tool_calls:
+                    custom_logger(list(tool_calls.values()))
+                    custom_logger(f"Intermediate completion {content}")
+                    parsed_calls: list[ToolCall] = [serde.decode_tool_call(tool_call) for tool_call in
+                                                    tool_calls.values()]
+                    messages.append(Message(role="assistant", content=content, tool_calls=parsed_calls))
+                    outputs = await asyncio.gather(*[call.execute() for call in parsed_calls])
+                    messages.extend([
+                        Message(tool_call_id=call.id, name=call.name, role="tool", content=output)
+                        for call, output in zip(parsed_calls, outputs)
+                    ])
+
         custom_logger(f"Got completion {content} from OpenAIEngine.")
         return Message(role="assistant", content=content)
 
@@ -250,16 +306,16 @@ class AnthropicEngine(ChatCompletionEngine):
 
     async def complete(self, messages: list[Message], out: DeltaGenerator | None = None) -> Message:
         c = anthropic.AsyncAnthropic()
-        messages_ = [dataclasses.asdict(m) for m in messages if m.role != "system"]
+        serde = AnthropicSerDe()
         system = next(iter(m.content for m in messages if m.role == "system"), None)
         content = ""
         async with (await c.messages.create(
             max_tokens=4096,
-            messages=messages_,
+            messages=(serde.messages(messages)),
             model=self.model,
             system=system,
             stream=True,
-            tools=[AnthropicEncoder().tool(tool) for tool in self.tools],
+            tools=[serde.encode_tool(tool) for tool in self.tools],
         )) as stream:
             async for chunk in stream:
                 if isinstance(chunk, ContentBlockDeltaEvent):
@@ -345,7 +401,12 @@ def get_placeholders(n: int):
 
 
 def get_selected_tools() -> list[Tool]:
-    tools_raw = st.multiselect('Tools', options=list(TOOLS), default=list(TOOLS))
+    tools_raw = st.multiselect(
+        'Tools',
+        options=list(TOOLS),
+        default=list(TOOLS),
+        format_func=lambda k: TOOL_ALIASES.get(k, k)
+    )
     return [TOOLS[k] for k in tools_raw]
 
 
