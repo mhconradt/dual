@@ -12,7 +12,9 @@ from typing import Literal, Callable, Any
 
 import anthropic
 import streamlit as st
-from anthropic.types import ContentBlockDeltaEvent
+from anthropic.types import ContentBlockDeltaEvent, RawContentBlockStartEvent, TextDelta, ToolUseBlock, InputJsonDelta, \
+    RawMessageDeltaEvent
+from anthropic.types.raw_content_block_delta_event import Delta
 from openai import AsyncOpenAI
 from streamlit.delta_generator import DeltaGenerator
 
@@ -214,7 +216,7 @@ class AnthropicSerDe:
         }
 
     def decode_tool_call(self, tool_call: dict) -> "ToolCall":
-        return ToolCall(name=tool_call['name'], arguments=json.loads(tool_call['arguments']))
+        return ToolCall(id=tool_call['id'], name=tool_call['name'], arguments=json.loads(tool_call['arguments']))
 
 
 class ChatCompletionEngine(ABC):
@@ -291,8 +293,8 @@ class OpenAIEngine(ChatCompletionEngine):
                     custom_logger(f"Intermediate completion {content}")
                     parsed_calls: list[ToolCall] = [serde.decode_tool_call(tool_call) for tool_call in
                                                     tool_calls.values()]
-                    messages.append(Message(role="assistant", content=content, tool_calls=parsed_calls))
                     outputs = await asyncio.gather(*[call.execute() for call in parsed_calls])
+                    messages.append(Message(role="assistant", content=content, tool_calls=parsed_calls))
                     messages.extend([
                         Message(tool_call_id=call.id, name=call.name, role="tool", content=output)
                         for call, output in zip(parsed_calls, outputs)
@@ -308,19 +310,40 @@ class AnthropicEngine(ChatCompletionEngine):
         c = anthropic.AsyncAnthropic()
         serde = AnthropicSerDe()
         system = next(iter(m.content for m in messages if m.role == "system"), None)
+        stop_reason = None
+        messages = list(messages)
+        messages_ = serde.messages(messages)
         content = ""
-        async with (await c.messages.create(
-            max_tokens=4096,
-            messages=(serde.messages(messages)),
-            model=self.model,
-            system=system,
-            stream=True,
-            tools=[serde.encode_tool(tool) for tool in self.tools],
-        )) as stream:
-            async for chunk in stream:
-                if isinstance(chunk, ContentBlockDeltaEvent):
-                    content += chunk.delta.text
-                mprintm(Message(role="assistant", content=content), self.model, out=out)
+        while stop_reason != "end_turn" or not content:
+            async with (await c.messages.create(
+                messages=messages_,
+                max_tokens=4096,
+                model=self.model,
+                system=system,
+                stream=True,
+                tools=[serde.encode_tool(tool) for tool in self.tools],
+            )) as stream:
+                tool_calls = defaultdict(lambda: defaultdict(str))
+                k = None
+                async for chunk in stream:
+                    if isinstance(chunk, RawContentBlockStartEvent) and isinstance(chunk.content_block, ToolUseBlock):
+                        k = chunk.content_block.id
+                        tool_calls[k]['id'] = k
+                        tool_calls[k]['name'] = chunk.content_block.name
+                    custom_logger(chunk)
+                    if isinstance(chunk, ContentBlockDeltaEvent) and isinstance(chunk.delta, TextDelta):
+                        content += chunk.delta.text
+                    if isinstance(chunk, ContentBlockDeltaEvent) and isinstance(chunk.delta, InputJsonDelta):
+                        tool_calls[k]['input'] += chunk.delta.partial_json
+                    if isinstance(chunk, RawMessageDeltaEvent) and isinstance(chunk.delta, Delta):
+                        stop_reason = chunk.delta.stop_reason
+                    mprintm(Message(role="assistant", content=content), self.model, out=out)
+                if tool_calls:
+                    all_calls = list(tool_calls.values())
+                    custom_logger(all_calls)
+                    parsed_calls = [serde.decode_tool_call(call) for call in all_calls]
+                    outputs = await asyncio.gather(*[call.execute() for call in parsed_calls])
+
         custom_logger(f"Got completion {content} from AnthropicEngine.")
         return Message(role="assistant", content=content)
 
