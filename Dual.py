@@ -112,10 +112,11 @@ async def shell(command: str):
 
 
 def quote(text: str, sep: str = '```') -> str:
+    if isinstance(text, bytes):
+        text = text.decode('utf-8')
     return '\n'.join([sep, text, sep])
 
-
-def get_program_output(exit_code, stderr, stdout):
+def get_program_output(stdout, stderr, exit_code) -> str:
     parts = []
     if stdout:
         parts.extend(['## stdout', quote(stdout)])
@@ -216,7 +217,8 @@ class AnthropicSerDe:
         }
 
     def decode_tool_call(self, tool_call: dict) -> "ToolCall":
-        return ToolCall(id=tool_call['id'], name=tool_call['name'], arguments=json.loads(tool_call['arguments']))
+        return ToolCall(id=tool_call['id'], name=tool_call['name'],
+        arguments=json.loads(tool_call['input']))
 
 
 class ChatCompletionEngine(ABC):
@@ -315,6 +317,8 @@ class AnthropicEngine(ChatCompletionEngine):
         messages_ = serde.messages(messages)
         content = ""
         while stop_reason != "end_turn" or not content:
+            content = ''
+            custom_logger(messages_)
             async with (await c.messages.create(
                 messages=messages_,
                 max_tokens=4096,
@@ -335,14 +339,27 @@ class AnthropicEngine(ChatCompletionEngine):
                         content += chunk.delta.text
                     if isinstance(chunk, ContentBlockDeltaEvent) and isinstance(chunk.delta, InputJsonDelta):
                         tool_calls[k]['input'] += chunk.delta.partial_json
-                    if isinstance(chunk, RawMessageDeltaEvent) and isinstance(chunk.delta, Delta):
+                    if isinstance(chunk, RawMessageDeltaEvent):
                         stop_reason = chunk.delta.stop_reason
                     mprintm(Message(role="assistant", content=content), self.model, out=out)
                 if tool_calls:
                     all_calls = list(tool_calls.values())
                     custom_logger(all_calls)
                     parsed_calls = [serde.decode_tool_call(call) for call in all_calls]
+                    content_ = [{"type": "text", "text": content}]
+                    content_.extend([{"type": "tool_use", "id": call.id,
+                    "name": call.name, "input": call.arguments} for call in
+                    parsed_calls])
+                    messages_.append({"role": "assistant", "content":
+                    content_})
                     outputs = await asyncio.gather(*[call.execute() for call in parsed_calls])
+                    custom_logger(outputs)
+                    content_ = [{"type": "tool_result", "content": output,
+                    "tool_use_id": call.id} for output, call in zip(outputs,
+                    parsed_calls)]
+                    messages_.append({"role": "user", "content": content_})
+                else:
+                    break
 
         custom_logger(f"Got completion {content} from AnthropicEngine.")
         return Message(role="assistant", content=content)
